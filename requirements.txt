@@ -1,0 +1,9 @@
+streamlit
+pandas
+openpyxl
+python-dotenv
+sqlalchemy
+pymysql
+zeep
+requests
+pydantic
