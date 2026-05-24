@@ -7,3 +7,5 @@ pymysql
 zeep
 requests
 pydantic
+gspread
+google-auth
