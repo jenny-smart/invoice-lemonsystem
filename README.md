@@ -1,21 +1,17 @@
 # invoice-lemonsystem
 
-檸檬家事發票與折讓單 Streamlit 工具。
+Streamlit app for 檸檬家事發票系統.
 
-## Streamlit Cloud 設定
+## Streamlit Cloud
 
-- App URL: `invoice-lemonsystem.streamlit.app`
+- App name: `invoice-lemonsystem`
 - Main file path: `lemoninvoice.py`
 
-## Local Run
+## Current Version
 
-```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-streamlit run lemoninvoice.py
-```
-
-## Secrets
-
-正式部署請在 Streamlit Cloud 的 Secrets 設定資料庫與鯨躍 API 參數，不要 commit `.env` 或 secrets。
+- 台北 / 台中 / 桃園 / 新竹 / 高雄各自設定發票系統帳密、檸檬家事帳密、帳務處理表 Google Sheet ID。
+- 只從檸檬家事讀資料，不寫回檸檬家事後台。
+- 發票號碼與折讓單號回填各區帳務處理表。
+- 訂單編號一律轉成 `原訂單編號-1`。
+- 有統編時，發票姓名欄用抬頭、填統編、選含稅。
+- 折讓金額以含稅輸入，系統回推未稅金額與稅額。
