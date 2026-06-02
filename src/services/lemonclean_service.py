@@ -5,14 +5,14 @@ from typing import Dict
 
 def fetch_order_detail_from_lemonclean(region: str, order_id: str, cfg: Dict[str, str], dry_run: bool = True) -> Dict[str, str]:
     """
-    Login to Lemonclean and fetch order detail.
-    This function must only read Lemonclean data. Do not write back.
+    依 G 欄訂單編號轉成的「訂單編號-1」登入檸檬官網查資料。
+    僅讀取，不回寫檸檬家事後台。
     """
     if dry_run:
-        if order_id.endswith("0042-1"):
+        if order_id.endswith("41001-1"):
             return {
                 "訂單編號": order_id,
-                "客戶姓名": "範例公司",
+                "客戶姓名": "張嘉芸",
                 "抬頭": "範例股份有限公司",
                 "統編": "12345678",
                 "電話": "0912345678",
@@ -21,9 +21,10 @@ def fetch_order_detail_from_lemonclean(region: str, order_id: str, cfg: Dict[str
                 "服務名稱": "清潔服務",
                 "服務類型代碼": "1",
             }
+
         return {
             "訂單編號": order_id,
-            "客戶姓名": "王小明",
+            "客戶姓名": "一般客戶",
             "抬頭": "",
             "統編": "",
             "電話": "0912345678",
@@ -33,5 +34,4 @@ def fetch_order_detail_from_lemonclean(region: str, order_id: str, cfg: Dict[str
             "服務類型代碼": "1",
         }
 
-    # TODO: Use requests.Session to login and parse order detail page or use internal API if available.
     raise NotImplementedError("檸檬家事登入讀取尚未接上正式 endpoint。")

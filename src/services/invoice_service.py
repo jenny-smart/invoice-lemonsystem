@@ -31,7 +31,7 @@ class InvoiceService:
             "</ProductItem>"
         )
 
-        xml = (
+        return (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<Invoice XSDVersion="2.8">'
             f"<OrderId>{escape(str(payload['order_id']))}</OrderId>"
@@ -39,11 +39,7 @@ class InvoiceService:
             f"<BuyerIdentifier>{escape(str(payload.get('buyer_identifier', '')))}</BuyerIdentifier>"
             f"<BuyerName>{escape(str(payload.get('buyer_name', '')))}</BuyerName>"
             f"<BuyerAddress>{escape(str(payload.get('buyer_address', '')))}</BuyerAddress>"
-            "<BuyerPersonInCharge></BuyerPersonInCharge>"
-            "<BuyerTelephoneNumber></BuyerTelephoneNumber>"
-            "<BuyerFacsimileNumber></BuyerFacsimileNumber>"
             f"<BuyerEmailAddress>{escape(str(payload.get('buyer_email', '')))}</BuyerEmailAddress>"
-            "<BuyerCustomerNumber></BuyerCustomerNumber>"
             f"<DonateMark>{int(payload.get('donate_mark', 0))}</DonateMark>"
             "<InvoiceType>07</InvoiceType>"
             f"<CarrierType>{escape(str(payload.get('carrier_type', '')))}</CarrierType>"
@@ -57,7 +53,6 @@ class InvoiceService:
             f"<Details>{product}</Details>"
             "</Invoice>"
         )
-        return xml
 
     def create_invoice(self, payload: Dict[str, object]) -> Dict[str, object]:
         xml = self.build_invoice_xml(payload)
@@ -74,16 +69,14 @@ class InvoiceService:
             }
 
         from zeep import Client
-
         client = Client(self._wsdl())
         result = client.service.CreateInvoiceV3(**params)
-        invoice_no = getattr(result, "return", result)
-
+        raw = str(getattr(result, "return", result))
         return {
-            "success": len(str(invoice_no)) == 10,
-            "invoice_no": str(invoice_no) if len(str(invoice_no)) == 10 else "",
-            "message": "發票開立成功" if len(str(invoice_no)) == 10 else f"發票開立失敗：{invoice_no}",
-            "raw": str(invoice_no),
+            "success": len(raw) == 10,
+            "invoice_no": raw if len(raw) == 10 else "",
+            "message": "發票開立成功" if len(raw) == 10 else f"發票開立失敗：{raw}",
+            "raw": raw,
         }
 
     def query_invoice_number(self, order_id: str) -> Dict[str, object]:
@@ -100,21 +93,18 @@ class InvoiceService:
             }
 
         from zeep import Client
-
         client = Client(self._wsdl())
         result = client.service.QueryInvoiceNumberByOrderid(**params)
-        invoice_no = getattr(result, "return", result)
-
+        raw = str(getattr(result, "return", result))
         return {
-            "success": len(str(invoice_no)) == 10,
-            "invoice_no": str(invoice_no) if len(str(invoice_no)) == 10 else "",
-            "message": "查詢成功" if len(str(invoice_no)) == 10 else f"查詢失敗：{invoice_no}",
-            "raw": str(invoice_no),
+            "success": len(raw) == 10,
+            "invoice_no": raw if len(raw) == 10 else "",
+            "message": "查詢成功" if len(raw) == 10 else f"查詢失敗：{raw}",
+            "raw": raw,
         }
 
     def build_allowance_xml(self, payload: Dict[str, object]) -> str:
-        # 方法名稱需依鯨躍正式規格確認。現有 Laravel 程式只有錯誤碼，未看到折讓 SOAP 實作。
-        xml = (
+        return (
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<Allowance XSDVersion="2.8">'
             f"<OrderId>{escape(str(payload['order_id']))}</OrderId>"
@@ -126,7 +116,6 @@ class InvoiceService:
             f"<Reason>{escape(str(payload.get('reason', '退款折讓')))}</Reason>"
             "</Allowance>"
         )
-        return xml
 
     def create_allowance(self, payload: Dict[str, object]) -> Dict[str, object]:
         xml = self.build_allowance_xml(payload)

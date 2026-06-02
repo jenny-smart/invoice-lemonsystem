@@ -44,11 +44,7 @@ class NewebPayService:
             "MerchantOrderNo": merchant_order_no,
         }
         encrypted = self.encrypt_post_data(post_data)
-
-        payload = {
-            "MerchantID_": merchant_id,
-            "PostData_": encrypted,
-        }
+        payload = {"MerchantID_": merchant_id, "PostData_": encrypted}
 
         if self.dry_run:
             return {

@@ -1,28 +1,17 @@
-# invoice-lemonsystem
+# invoice-lemonsystem v4
 
-Streamlit app for 檸檬家事發票、折讓單、發票查詢、藍新金流流程。
+Main file path: `lemoninvoice.py`
 
-## Streamlit Cloud
+## v4 workflow
 
-- App name: `invoice-lemonsystem`
-- Main file path: `lemoninvoice.py`
+This version uses one accounting worksheet per region.
 
-## Version 3 scope
+Rules:
 
-- 鯨躍／關網 SOAP:
-  - `CreateInvoiceV3`
-  - `QueryInvoiceNumberByOrderid`
-  - 折讓單 payload scaffold（正式 method 需向鯨躍確認）
-- 藍新金流:
-  - `CreditCard/Cancel` payload scaffold
-- 各區設定:
-  - 台北 / 台中 / 桃園 / 新竹 / 高雄
-  - RentID
-  - 檸檬家事帳密（只讀）
-  - 各區帳務處理表 ID
-  - 藍新 MerchantID / HashKey / HashIV
-- 預設為 Dry Run，不會真正送出 API。
-
-## Important
-
-Do not commit real credentials to GitHub. Use Streamlit Cloud Secrets.
+- B column status = `待收款` → create invoice.
+- B column status = `待退款` → create allowance.
+- G column = order id.
+- System order id is always `G欄訂單編號-1`.
+- Login to Lemonclean by order id and read order data only.
+- Do not write back to Lemonclean.
+- Write invoice number or allowance number back to the same accounting worksheet.
