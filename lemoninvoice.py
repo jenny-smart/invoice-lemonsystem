@@ -1,57 +1,90 @@
-"""
-檸檬家事發票系統 - Streamlit App
-主入口：lemoninvoice.py
-
-新版流程：
-- 台北 / 台中 / 桃園 / 新竹 / 高雄各自設定發票系統帳密、檸檬家事帳密、帳務處理表 ID。
-- 不寫回檸檬家事後台，只從檸檬家事抓資料。
-- 從各區帳務處理表讀取訂單編號、發票金額、發票號碼、折讓單含稅金額。
-- 訂單編號一律轉成「原訂單編號-1」。
-- 有統編時：原發票姓名欄填抬頭、填統編欄位、選含稅。
-- 開完發票號碼或折讓單號後，回填各區帳務處理表。
-"""
-
 from __future__ import annotations
+
 from datetime import date
 from io import BytesIO
 from typing import Dict, List
+
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="檸檬家事發票系統", page_icon="🧾", layout="wide", initial_sidebar_state="collapsed")
+from src.services.invoice_service import InvoiceService
+from src.services.newebpay_service import NewebPayService
+from src.services.sheet_service import (
+    read_invoice_rows_from_accounting_sheet,
+    read_allowance_rows_from_accounting_sheet,
+    write_invoice_result,
+    write_allowance_result,
+    write_newebpay_result,
+)
+from src.services.lemonclean_service import fetch_order_detail_from_lemonclean
+from src.utils.money import calc_pretax, calc_tax
 
-st.markdown("""
+
+st.set_page_config(
+    page_title="檸檬家事發票系統",
+    page_icon="🧾",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+st.markdown(
+    """
 <style>
 [data-testid="stSidebarNav"] { display: none; }
 section[data-testid="stSidebar"] { display: none; }
-.block-container { padding-top: 0.5rem !important; max-width: 1400px; }
-.top-logo { display:flex; align-items:center; gap:10px; padding:10px 0 4px 0; font-size:19px; font-weight:700; color:#0F6E56; border-bottom:1px solid #e8e8e8; margin-bottom:0.5rem; }
+.block-container { padding-top: 0.5rem !important; max-width: 1420px; }
+.top-logo {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 0 4px 0; font-size: 19px; font-weight: 700;
+    color: #0F6E56; border-bottom: 1px solid #e8e8e8; margin-bottom: 0.5rem;
+}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 DEFAULT_REGIONS = ["台北", "台中", "桃園", "新竹", "高雄"]
-ACTION_TYPES = ["開立發票", "開立折讓單", "全部"]
-TABS = ["首頁", "開立發票", "開立折讓單", "下載發票", "下載紙本發票", "設定"]
+TABS = ["首頁", "開立發票", "發票下載", "開立折讓單", "藍新金流", "下載檔案", "設定"]
+
 
 def default_region_config() -> Dict[str, Dict[str, str]]:
-    return {r: {
-        "invoice_user": "", "invoice_pass": "",
-        "lemon_user": "", "lemon_pass": "",
-        "sheet_id": "", "sheet_name_invoice": "開立發票", "sheet_name_allowance": "開立折讓單",
-    } for r in DEFAULT_REGIONS}
+    cfg: Dict[str, Dict[str, str]] = {}
+    for region in DEFAULT_REGIONS:
+        cfg[region] = {
+            "invoice_wsdl": "https://www.ei.com.tw/InvoiceB2C/InvoiceAPI?wsdl",
+            "invoice_test_wsdl": "http://invoice.cetustek.com.tw/InvoiceB2C/InvoiceAPI?wsdl",
+            "invoice_rent_id": "",
+            "lemon_user": "",
+            "lemon_pass": "",
+            "sheet_id": "",
+            "sheet_name_invoice": "開立發票",
+            "sheet_name_allowance": "開立折讓單",
+            "sheet_name_newebpay": "藍新金流",
+            "newebpay_merchant_id": "",
+            "newebpay_hash_key": "",
+            "newebpay_hash_iv": "",
+            "newebpay_cancel_url": "https://core.spgateway.com/API/CreditCard/Cancel",
+        }
+    return cfg
 
-def init_state():
-    defaults = {
-        "active_tab": "首頁", "active_region": DEFAULT_REGIONS[0],
-        "region_config": default_region_config(),
-        "date_start": date.today().replace(day=1), "date_end": date.today(),
-        "action_type": "全部", "result_df": None, "allowance_df": None, "execution_log": [],
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
 
-init_state()
+defaults = {
+    "active_tab": "首頁",
+    "active_region": DEFAULT_REGIONS[0],
+    "region_config": default_region_config(),
+    "date_start": date.today().replace(day=1),
+    "date_end": date.today(),
+    "dry_run": True,
+    "result_df": None,
+    "allowance_df": None,
+    "newebpay_df": None,
+    "execution_log": [],
+}
+
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
 
 def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "data") -> bytes:
     output = BytesIO()
@@ -59,246 +92,415 @@ def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "data") -> bytes:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
     return output.getvalue()
 
+
 def normalized_order_id(raw_id: str) -> str:
     raw_id = str(raw_id).strip()
     return raw_id if raw_id.endswith("-1") else f"{raw_id}-1"
 
-def calc_pretax(amount_with_tax: float, tax_rate: float = 0.05) -> int:
-    return round(float(amount_with_tax) / (1 + tax_rate)) if amount_with_tax else 0
-
-def calc_tax(amount_with_tax: float, tax_rate: float = 0.05) -> int:
-    return int(round(float(amount_with_tax) - calc_pretax(amount_with_tax, tax_rate)))
 
 def get_regions() -> List[str]:
     return list(st.session_state.region_config.keys())
 
+
 def get_cfg(region: str) -> Dict[str, str]:
     return st.session_state.region_config.get(region, {})
 
+
 def is_region_ready(region: str) -> bool:
     cfg = get_cfg(region)
-    return all(cfg.get(k) for k in ["invoice_user", "invoice_pass", "lemon_user", "lemon_pass", "sheet_id"])
+    required = ["invoice_rent_id", "sheet_id", "lemon_user", "lemon_pass"]
+    return all(bool(cfg.get(k)) for k in required)
+
 
 def add_log(message: str) -> None:
     st.session_state.execution_log.insert(0, f"{date.today()}｜{message}")
 
-# TODO: replace stub functions with real Google Sheets / Lemonclean / invoice system integrations.
-def read_invoice_rows_from_accounting_sheet(region: str, date_start: date, date_end: date) -> pd.DataFrame:
-    rows = [
-        {"列號": 2, "區域": region, "原始訂單編號": "LC202605240001", "訂單編號": normalized_order_id("LC202605240001"), "發票金額": 3000, "帳務表發票號碼": "", "處理狀態": "待開立"},
-        {"列號": 3, "區域": region, "原始訂單編號": "LC202605230042", "訂單編號": normalized_order_id("LC202605230042"), "發票金額": 5250, "帳務表發票號碼": "", "處理狀態": "待開立"},
-    ]
-    return pd.DataFrame(rows)
-
-def read_allowance_rows_from_accounting_sheet(region: str, date_start: date, date_end: date) -> pd.DataFrame:
-    rows = [{"列號": 2, "區域": region, "原始訂單編號": "LC202605180009", "訂單編號": normalized_order_id("LC202605180009"), "發票號碼": "CD98765432", "折讓含稅金額": 1050, "折讓未稅金額": calc_pretax(1050), "折讓稅額": calc_tax(1050), "折讓原因": "部分退款", "折讓單號": "", "處理狀態": "待開立"}]
-    return pd.DataFrame(rows)
-
-def fetch_order_detail_from_lemonclean(region: str, order_id: str) -> Dict[str, str]:
-    if order_id.endswith("0042-1"):
-        return {"訂單編號": order_id, "客戶姓名": "範例公司", "抬頭": "範例股份有限公司", "統編": "12345678", "電話": "0912345678", "地址": "台北市範例區範例路 1 號", "Email": "example@company.com"}
-    return {"訂單編號": order_id, "客戶姓名": "王小明", "抬頭": "", "統編": "", "電話": "0912345678", "地址": "台北市範例區檸檬路 1 號", "Email": "customer@example.com"}
 
 def build_invoice_payload(row: pd.Series, order: Dict[str, str]) -> Dict[str, object]:
     has_tax_id = bool(order.get("統編"))
+    invoice_name = order.get("抬頭") if has_tax_id else order.get("客戶姓名")
     return {
-        "order_id": row["訂單編號"], "invoice_amount": int(row["發票金額"]),
-        "invoice_name": order.get("抬頭") if has_tax_id else order.get("客戶姓名"),
-        "buyer_tax_id": order.get("統編", ""), "is_tax_included": has_tax_id,
-        "phone": order.get("電話", ""), "email": order.get("Email", ""), "address": order.get("地址", ""),
-        "source_region": row["區域"],
+        "order_id": row["訂單編號"],
+        "order_date": date.today().strftime("%Y/%m/%d"),
+        "buyer_identifier": order.get("統編", ""),
+        "buyer_name": invoice_name,
+        "buyer_address": order.get("地址", ""),
+        "buyer_email": order.get("Email", ""),
+        "donate_mark": 2 if has_tax_id else 0,
+        "carrier_type": "",
+        "carrier_id1": "",
+        "carrier_id2": "",
+        "npoban": "",
+        "tax_type": 1,
+        "tax_rate": 0.05,
+        "pay_way": 3,
+        "production_code": order.get("服務類型代碼", "1"),
+        "description": order.get("服務名稱", "清潔服務"),
+        "unit_price": int(row["發票金額"]),
+        "is_tax_included": has_tax_id,
+        "region": row["區域"],
     }
 
-def issue_invoice_to_invoice_system(region: str, payload: Dict[str, object]) -> Dict[str, str]:
-    fake_invoice_no = "AB" + str(abs(hash(payload["order_id"])))[0:8]
-    return {"success": True, "invoice_no": fake_invoice_no, "message": "測試模式：發票開立成功"}
 
-def issue_allowance_to_invoice_system(region: str, row: pd.Series) -> Dict[str, str]:
-    fake_allowance_no = "AL" + str(abs(hash(str(row["發票號碼"]) + str(row["訂單編號"]))))[0:8]
-    return {"success": True, "allowance_no": fake_allowance_no, "message": "測試模式：折讓單開立成功"}
-
-def write_invoice_no_back_to_sheet(region: str, row_number: int, invoice_no: str) -> None:
-    add_log(f"{region} 第 {row_number} 列已回填發票號碼 {invoice_no}")
-
-def write_allowance_no_back_to_sheet(region: str, row_number: int, allowance_no: str) -> None:
-    add_log(f"{region} 第 {row_number} 列已回填折讓單號 {allowance_no}")
-
-st.markdown('<div class="top-logo">🧾 檸檬家事發票系統</div>', unsafe_allow_html=True)
-
-tab_cols = st.columns(len(TABS))
-for i, (col, tab_name) in enumerate(zip(tab_cols, TABS)):
-    with col:
-        label = f"**{tab_name}**" if tab_name == st.session_state.active_tab else tab_name
-        if st.button(label, key=f"tab_{i}", use_container_width=True):
-            st.session_state.active_tab = tab_name
-            st.rerun()
-st.markdown("---")
-
-run_clicked = False
-if st.session_state.active_tab != "設定":
-    regions = get_regions()
-    col_d1, col_d2, col_sep, col_act, col_reg, col_run = st.columns([2, 2, 0.2, 2, 2, 1.5])
-    with col_d1:
-        st.session_state.date_start = st.date_input("開始日期", value=st.session_state.date_start, key="filter_date_start", label_visibility="collapsed")
-    with col_d2:
-        st.session_state.date_end = st.date_input("結束日期", value=st.session_state.date_end, key="filter_date_end", label_visibility="collapsed")
-    with col_sep:
-        st.markdown("<div style='padding-top:8px;text-align:center;color:#9ca3af'>～</div>", unsafe_allow_html=True)
-    with col_act:
-        st.session_state.action_type = st.selectbox("執行項目", ACTION_TYPES, index=ACTION_TYPES.index(st.session_state.action_type), key="filter_action", label_visibility="collapsed")
-    with col_reg:
-        if st.session_state.active_region not in regions:
-            st.session_state.active_region = regions[0]
-        selected = st.selectbox("執行區域", regions, index=regions.index(st.session_state.active_region), key="filter_region", label_visibility="collapsed")
-        if selected != st.session_state.active_region:
-            st.session_state.active_region = selected
-            st.session_state.result_df = None
-            st.session_state.allowance_df = None
-            st.rerun()
-    with col_run:
-        run_clicked = st.button("▶ 執行", type="primary", use_container_width=True)
+def render_top_nav() -> None:
+    st.markdown('<div class="top-logo">🧾 檸檬家事發票系統</div>', unsafe_allow_html=True)
+    tab_cols = st.columns(len(TABS))
+    for i, (col, tab_name) in enumerate(zip(tab_cols, TABS)):
+        with col:
+            label = f"**{tab_name}**" if tab_name == st.session_state.active_tab else tab_name
+            if st.button(label, key=f"tab_{i}", use_container_width=True):
+                st.session_state.active_tab = tab_name
+                st.rerun()
     st.markdown("---")
 
-if run_clicked and st.session_state.active_region:
-    region = st.session_state.active_region
-    tab = st.session_state.active_tab
-    if not is_region_ready(region):
-        st.warning(f"{region} 尚未完整設定帳密與帳務處理表 ID，請先到「設定」填寫。")
-    else:
-        with st.spinner(f"讀取 {region} 帳務處理表…"):
-            if tab in ("首頁", "開立發票", "下載發票", "下載紙本發票"):
-                st.session_state.result_df = read_invoice_rows_from_accounting_sheet(region, st.session_state.date_start, st.session_state.date_end)
-                add_log(f"已讀取 {region} 待開發票資料")
-            elif tab == "開立折讓單":
-                st.session_state.allowance_df = read_allowance_rows_from_accounting_sheet(region, st.session_state.date_start, st.session_state.date_end)
-                add_log(f"已讀取 {region} 待開折讓單資料")
+
+def render_filter_bar() -> bool:
+    if st.session_state.active_tab == "設定":
+        return False
+
+    regions = get_regions()
+    c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 1.5])
+
+    with c1:
+        st.session_state.date_start = st.date_input("開始日期", st.session_state.date_start, label_visibility="collapsed")
+    with c2:
+        st.session_state.date_end = st.date_input("結束日期", st.session_state.date_end, label_visibility="collapsed")
+    with c3:
+        if st.session_state.active_region not in regions:
+            st.session_state.active_region = regions[0]
+        st.session_state.active_region = st.selectbox(
+            "執行區域",
+            regions,
+            index=regions.index(st.session_state.active_region),
+            label_visibility="collapsed",
+        )
+    with c4:
+        st.session_state.dry_run = st.toggle("測試模式，不真正送出", value=st.session_state.dry_run)
+    with c5:
+        clicked = st.button("▶ 執行", type="primary", use_container_width=True)
+
+    st.markdown("---")
+    return clicked
+
 
 def page_home() -> None:
     region = st.session_state.active_region
     cfg = get_cfg(region)
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("目前區域", region)
-    c2.metric("發票資料來源", "帳務處理表")
+    c2.metric("發票模式", "測試" if st.session_state.dry_run else "正式")
     c3.metric("檸檬家事", "只讀")
     c4.metric("回填位置", "帳務處理表")
-    st.divider()
-    st.subheader("目前流程")
-    st.markdown("""
-1. 選擇區域。
-2. 從該區帳務處理表讀取要處理的訂單。
-3. 訂單編號一律轉成 `原訂單編號-1`。
-4. 登入檸檬家事，只抓訂單資料，不回寫後台。
-5. 登入該區發票系統開立發票或折讓單。
-6. 將發票號碼或折讓單號回填該區帳務處理表。
-""")
+
+    st.subheader("流程")
+    st.markdown(
+        """
+1. 從各區帳務處理表讀取訂單編號與金額。
+2. 訂單編號自動轉為 `原訂單編號-1`。
+3. 登入檸檬家事抓訂單資訊，但不回寫檸檬家事。
+4. 呼叫鯨躍／關網發票 SOAP API 開立發票、查詢發票、建立折讓單。
+5. 呼叫藍新金流 API 處理金流查詢或取消授權。
+6. 發票號碼、折讓單號、藍新處理結果回填各區帳務處理表。
+"""
+    )
+
     st.subheader(f"{region} 設定狀態")
-    rows = [{"項目": name, "狀態": "✅" if cfg.get(key) else "❌"} for name, key in [("發票系統帳號", "invoice_user"), ("發票系統密碼", "invoice_pass"), ("檸檬家事帳號", "lemon_user"), ("檸檬家事密碼", "lemon_pass"), ("帳務處理表 ID", "sheet_id")]]
+    rows = [
+        {"項目": "發票 RentID", "狀態": "✅" if cfg.get("invoice_rent_id") else "❌"},
+        {"項目": "檸檬家事帳號", "狀態": "✅" if cfg.get("lemon_user") else "❌"},
+        {"項目": "檸檬家事密碼", "狀態": "✅" if cfg.get("lemon_pass") else "❌"},
+        {"項目": "帳務處理表 ID", "狀態": "✅" if cfg.get("sheet_id") else "❌"},
+        {"項目": "藍新 MerchantID", "狀態": "✅" if cfg.get("newebpay_merchant_id") else "❌"},
+    ]
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
 
 def page_issue_invoice() -> None:
     region = st.session_state.active_region
+    cfg = get_cfg(region)
     st.subheader(f"開立發票｜{region}")
+
     df = st.session_state.result_df
     if df is None:
-        st.info("請設定日期與區域後按「▶ 執行」，從該區帳務處理表讀取待開發票訂單。")
+        st.info("請按「▶ 執行」讀取待開發票資料。")
         return
+
     enriched_rows = []
     for _, row in df.iterrows():
-        order = fetch_order_detail_from_lemonclean(region, row["訂單編號"])
+        row = row.copy()
+        row["訂單編號"] = normalized_order_id(row["原始訂單編號"])
+        order = fetch_order_detail_from_lemonclean(region, row["訂單編號"], cfg, dry_run=st.session_state.dry_run)
         payload = build_invoice_payload(row, order)
-        enriched_rows.append({**row.to_dict(), **order, "發票姓名欄": payload["invoice_name"], "是否含稅": "是" if payload["is_tax_included"] else "否"})
+        enriched_rows.append({
+            **row.to_dict(),
+            **order,
+            "發票姓名欄": payload["buyer_name"],
+            "是否含稅": "是" if payload["is_tax_included"] else "否",
+        })
+
     view_df = pd.DataFrame(enriched_rows)
-    st.markdown(f"共找到 **{len(view_df)}** 筆待開發票資料")
-    st.dataframe(view_df[["列號", "原始訂單編號", "訂單編號", "客戶姓名", "抬頭", "統編", "發票姓名欄", "是否含稅", "發票金額", "帳務表發票號碼", "處理狀態"]], use_container_width=True, hide_index=True)
-    col_run, col_dl = st.columns([2, 1])
-    with col_run:
-        if st.button("🧾 批次開立發票並回填帳務表", type="primary", use_container_width=True):
-            results = []
-            for _, row in view_df.iterrows():
-                order = fetch_order_detail_from_lemonclean(region, row["訂單編號"])
-                payload = build_invoice_payload(row, order)
-                result = issue_invoice_to_invoice_system(region, payload)
-                if result["success"]:
-                    write_invoice_no_back_to_sheet(region, int(row["列號"]), result["invoice_no"])
-                results.append({"訂單編號": row["訂單編號"], "發票金額": row["發票金額"], "發票號碼": result.get("invoice_no", ""), "結果": result["message"]})
-            st.success("測試模式完成：已模擬開立發票與回填帳務表。")
-            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
-    with col_dl:
-        st.download_button("⬇ 匯出 Excel", data=to_excel_bytes(view_df, "待開發票"), file_name=f"invoices_{region}_{date.today()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    st.dataframe(view_df, use_container_width=True, hide_index=True)
+
+    if st.button("🧾 批次開立發票並回填帳務表", type="primary"):
+        service = InvoiceService(cfg, dry_run=st.session_state.dry_run)
+        results = []
+
+        for _, row in view_df.iterrows():
+            order = fetch_order_detail_from_lemonclean(region, row["訂單編號"], cfg, dry_run=st.session_state.dry_run)
+            payload = build_invoice_payload(row, order)
+            result = service.create_invoice(payload)
+
+            if result["success"]:
+                write_invoice_result(region, cfg, int(row["列號"]), result, dry_run=st.session_state.dry_run)
+
+            results.append({
+                "列號": row["列號"],
+                "訂單編號": row["訂單編號"],
+                "發票金額": row["發票金額"],
+                "發票號碼": result.get("invoice_no", ""),
+                "結果": result.get("message", ""),
+            })
+
+        st.success("批次開立發票流程完成。")
+        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+
+
+def page_invoice_download() -> None:
+    region = st.session_state.active_region
+    cfg = get_cfg(region)
+    st.subheader(f"發票下載／查詢｜{region}")
+
+    order_id = st.text_input("訂單編號，可留空改用下方批次資料")
+    service = InvoiceService(cfg, dry_run=st.session_state.dry_run)
+
+    if st.button("查詢單筆發票號碼"):
+        result = service.query_invoice_number(order_id)
+        st.json(result)
+
+    st.divider()
+    df = st.session_state.result_df
+    if df is None:
+        st.info("按「▶ 執行」後可批次查詢帳務表訂單的發票號碼。")
+        return
+
+    if st.button("批次查詢發票號碼"):
+        results = []
+        for _, row in df.iterrows():
+            oid = normalized_order_id(row["原始訂單編號"])
+            result = service.query_invoice_number(oid)
+            results.append({
+                "列號": row["列號"],
+                "訂單編號": oid,
+                "發票號碼": result.get("invoice_no", ""),
+                "結果": result.get("message", ""),
+            })
+
+        out = pd.DataFrame(results)
+        st.dataframe(out, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇ 下載查詢結果",
+            data=to_excel_bytes(out, "發票查詢"),
+            file_name=f"invoice_query_{region}_{date.today()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
 
 def page_allowance() -> None:
     region = st.session_state.active_region
+    cfg = get_cfg(region)
     st.subheader(f"開立折讓單｜{region}")
+
     df = st.session_state.allowance_df
     if df is None:
-        st.info("請設定日期與區域後按「▶ 執行」，從該區帳務處理表讀取待開折讓單資料。")
+        st.info("請按「▶ 執行」讀取待開折讓單資料。")
         return
-    st.markdown(f"共找到 **{len(df)}** 筆待開折讓單資料")
-    st.dataframe(df[["列號", "原始訂單編號", "訂單編號", "發票號碼", "折讓含稅金額", "折讓未稅金額", "折讓稅額", "折讓原因", "折讓單號", "處理狀態"]], use_container_width=True, hide_index=True)
-    col_run, col_dl = st.columns([2, 1])
-    with col_run:
-        if st.button("📄 批次開立折讓單並回填帳務表", type="primary", use_container_width=True):
-            results = []
-            for _, row in df.iterrows():
-                result = issue_allowance_to_invoice_system(region, row)
-                if result["success"]:
-                    write_allowance_no_back_to_sheet(region, int(row["列號"]), result["allowance_no"])
-                results.append({"訂單編號": row["訂單編號"], "發票號碼": row["發票號碼"], "折讓含稅金額": row["折讓含稅金額"], "折讓未稅金額": row["折讓未稅金額"], "折讓稅額": row["折讓稅額"], "折讓單號": result.get("allowance_no", ""), "結果": result["message"]})
-            st.success("測試模式完成：已模擬開立折讓單與回填帳務表。")
-            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
-    with col_dl:
-        st.download_button("⬇ 匯出 Excel", data=to_excel_bytes(df, "待開折讓單"), file_name=f"allowances_{region}_{date.today()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
-def page_export_invoices(paper_only: bool = False) -> None:
+    df = df.copy()
+    df["折讓未稅金額"] = df["折讓含稅金額"].apply(calc_pretax)
+    df["折讓稅額"] = df["折讓含稅金額"].apply(calc_tax)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    if st.button("📄 批次開立折讓單並回填帳務表", type="primary"):
+        service = InvoiceService(cfg, dry_run=st.session_state.dry_run)
+        results = []
+
+        for _, row in df.iterrows():
+            result = service.create_allowance({
+                "order_id": normalized_order_id(row["原始訂單編號"]),
+                "invoice_no": row["發票號碼"],
+                "allowance_amount_with_tax": int(row["折讓含稅金額"]),
+                "allowance_amount_pretax": int(row["折讓未稅金額"]),
+                "allowance_tax": int(row["折讓稅額"]),
+                "reason": row.get("折讓原因", "退款折讓"),
+                "allowance_date": date.today().strftime("%Y/%m/%d"),
+            })
+
+            if result["success"]:
+                write_allowance_result(region, cfg, int(row["列號"]), result, dry_run=st.session_state.dry_run)
+
+            results.append({
+                "列號": row["列號"],
+                "訂單編號": normalized_order_id(row["原始訂單編號"]),
+                "發票號碼": row["發票號碼"],
+                "折讓含稅金額": row["折讓含稅金額"],
+                "折讓未稅金額": row["折讓未稅金額"],
+                "折讓稅額": row["折讓稅額"],
+                "折讓單號": result.get("allowance_no", ""),
+                "結果": result.get("message", ""),
+            })
+
+        st.success("批次開立折讓單流程完成。")
+        st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+
+
+def page_newebpay() -> None:
     region = st.session_state.active_region
-    title = "下載紙本發票" if paper_only else "下載發票"
-    st.subheader(f"{title}｜{region}")
-    st.caption("正式串接後會從各區帳務處理表或發票系統下載指定期間資料。")
-    if st.button("查詢", type="secondary"):
-        df = read_invoice_rows_from_accounting_sheet(region, st.session_state.date_start, st.session_state.date_end)
-        if paper_only:
-            df = df.copy(); df["紙本發票"] = "待串接欄位"
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        st.download_button("⬇ 下載 Excel", data=to_excel_bytes(df, "紙本發票" if paper_only else "發票"), file_name=(f"paper_invoices_{region}.xlsx" if paper_only else f"invoices_{region}.xlsx"), mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    cfg = get_cfg(region)
+    st.subheader(f"藍新金流｜{region}")
+
+    st.info("目前先支援藍新信用卡取消授權 API 流程；正式送出前請確認 MerchantID / HashKey / HashIV 已放在 Secrets。")
+
+    merchant_order_no = st.text_input("MerchantOrderNo / 訂單編號")
+    amount = st.number_input("取消授權金額", min_value=0, step=1)
+    service = NewebPayService(cfg, dry_run=st.session_state.dry_run)
+
+    if st.button("執行藍新取消授權"):
+        result = service.cancel_credit_card(merchant_order_no, int(amount))
+        if result["success"]:
+            write_newebpay_result(region, cfg, None, result, dry_run=st.session_state.dry_run)
+        st.json(result)
+
+
+def page_download_files() -> None:
+    region = st.session_state.active_region
+    st.subheader(f"下載檔案｜{region}")
+
+    invoice_df = st.session_state.result_df
+    allowance_df = st.session_state.allowance_df
+
+    if invoice_df is not None:
+        st.download_button(
+            "⬇ 下載待開發票資料",
+            data=to_excel_bytes(invoice_df, "待開發票"),
+            file_name=f"pending_invoices_{region}_{date.today()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    if allowance_df is not None:
+        st.download_button(
+            "⬇ 下載待開折讓單資料",
+            data=to_excel_bytes(allowance_df, "待開折讓單"),
+            file_name=f"pending_allowances_{region}_{date.today()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    if invoice_df is None and allowance_df is None:
+        st.info("目前沒有可下載資料，請先到開立發票或開立折讓單頁面執行讀取。")
+
 
 def page_settings() -> None:
     st.subheader("區域設定")
-    st.caption("台北 / 台中 / 桃園 / 新竹 / 高雄各自設定發票系統帳密、檸檬家事帳密、帳務處理表 ID。")
+    st.warning("正式帳密請放 Streamlit Cloud Secrets，不要 commit 到 GitHub。")
+
     for rname in get_regions():
         cfg = st.session_state.region_config[rname]
         with st.expander(f"📍 {rname}", expanded=(rname == st.session_state.active_region)):
             with st.form(f"settings_{rname}"):
-                st.markdown("**發票系統帳密**")
+                st.markdown("**鯨躍／關網發票 SOAP**")
                 c1, c2 = st.columns(2)
-                invoice_user = c1.text_input("發票系統帳號", value=cfg.get("invoice_user", ""), key=f"inv_u_{rname}")
-                invoice_pass = c2.text_input("發票系統密碼", value=cfg.get("invoice_pass", ""), type="password", key=f"inv_p_{rname}")
-                st.markdown("**檸檬家事帳密**")
+                invoice_rent_id = c1.text_input("RentID / 公司統編", value=cfg.get("invoice_rent_id", ""))
+                invoice_wsdl = c2.text_input("正式 WSDL", value=cfg.get("invoice_wsdl", ""))
+
+                st.markdown("**檸檬家事帳密（只讀）**")
                 c3, c4 = st.columns(2)
-                lemon_user = c3.text_input("檸檬家事帳號", value=cfg.get("lemon_user", ""), key=f"lm_u_{rname}")
-                lemon_pass = c4.text_input("檸檬家事密碼", value=cfg.get("lemon_pass", ""), type="password", key=f"lm_p_{rname}")
+                lemon_user = c3.text_input("檸檬家事帳號", value=cfg.get("lemon_user", ""))
+                lemon_pass = c4.text_input("檸檬家事密碼", value=cfg.get("lemon_pass", ""), type="password")
+
                 st.markdown("**帳務處理表**")
-                sheet_id = st.text_input("Google Sheet ID", value=cfg.get("sheet_id", ""), key=f"sheet_{rname}")
-                c5, c6 = st.columns(2)
-                sheet_name_invoice = c5.text_input("開立發票工作表名稱", value=cfg.get("sheet_name_invoice", "開立發票"), key=f"sheet_inv_{rname}")
-                sheet_name_allowance = c6.text_input("開立折讓單工作表名稱", value=cfg.get("sheet_name_allowance", "開立折讓單"), key=f"sheet_alw_{rname}")
-                if st.form_submit_button("儲存設定", type="primary", use_container_width=True):
-                    st.session_state.region_config[rname] = {"invoice_user": invoice_user, "invoice_pass": invoice_pass, "lemon_user": lemon_user, "lemon_pass": lemon_pass, "sheet_id": sheet_id, "sheet_name_invoice": sheet_name_invoice, "sheet_name_allowance": sheet_name_allowance}
+                sheet_id = st.text_input("Google Sheet ID", value=cfg.get("sheet_id", ""))
+                c5, c6, c7 = st.columns(3)
+                sheet_name_invoice = c5.text_input("發票工作表", value=cfg.get("sheet_name_invoice", "開立發票"))
+                sheet_name_allowance = c6.text_input("折讓工作表", value=cfg.get("sheet_name_allowance", "開立折讓單"))
+                sheet_name_newebpay = c7.text_input("藍新工作表", value=cfg.get("sheet_name_newebpay", "藍新金流"))
+
+                st.markdown("**藍新金流**")
+                c8, c9, c10 = st.columns(3)
+                newebpay_merchant_id = c8.text_input("MerchantID", value=cfg.get("newebpay_merchant_id", ""))
+                newebpay_hash_key = c9.text_input("HashKey", value=cfg.get("newebpay_hash_key", ""), type="password")
+                newebpay_hash_iv = c10.text_input("HashIV", value=cfg.get("newebpay_hash_iv", ""), type="password")
+
+                submitted = st.form_submit_button("儲存設定", type="primary", use_container_width=True)
+                if submitted:
+                    st.session_state.region_config[rname] = {
+                        **cfg,
+                        "invoice_rent_id": invoice_rent_id,
+                        "invoice_wsdl": invoice_wsdl,
+                        "lemon_user": lemon_user,
+                        "lemon_pass": lemon_pass,
+                        "sheet_id": sheet_id,
+                        "sheet_name_invoice": sheet_name_invoice,
+                        "sheet_name_allowance": sheet_name_allowance,
+                        "sheet_name_newebpay": sheet_name_newebpay,
+                        "newebpay_merchant_id": newebpay_merchant_id,
+                        "newebpay_hash_key": newebpay_hash_key,
+                        "newebpay_hash_iv": newebpay_hash_iv,
+                    }
                     st.success(f"已儲存 {rname} 設定。")
                     st.rerun()
-    st.divider(); st.subheader("Streamlit Secrets 範本")
-    st.warning("請不要把正式帳號密碼 commit 到 GitHub。正式部署請使用 Streamlit Cloud Secrets。")
-    st.code(open('.streamlit/secrets.example.toml', encoding='utf-8').read() if __import__('os').path.exists('.streamlit/secrets.example.toml') else '', language="toml")
+
+    st.divider()
+    st.subheader("Streamlit Secrets 範本")
+    st.code(open(".streamlit/secrets.example.toml", "r", encoding="utf-8").read(), language="toml")
+
 
 def page_logs() -> None:
-    if st.session_state.execution_log:
-        st.divider(); st.subheader("執行紀錄")
-        for item in st.session_state.execution_log[:10]: st.caption(item)
+    if not st.session_state.execution_log:
+        return
+    st.divider()
+    st.subheader("執行紀錄")
+    for item in st.session_state.execution_log[:10]:
+        st.caption(item)
+
+
+render_top_nav()
+run_clicked = render_filter_bar()
+
+if run_clicked and st.session_state.active_region:
+    region = st.session_state.active_region
+    cfg = get_cfg(region)
+    tab = st.session_state.active_tab
+
+    if not is_region_ready(region):
+        st.warning(f"{region} 尚未完整設定，請先到「設定」填寫。")
+    elif tab in ("首頁", "開立發票", "發票下載", "下載檔案"):
+        st.session_state.result_df = read_invoice_rows_from_accounting_sheet(
+            region, cfg, st.session_state.date_start, st.session_state.date_end, dry_run=st.session_state.dry_run
+        )
+        add_log(f"已讀取 {region} 待開發票資料")
+    elif tab == "開立折讓單":
+        st.session_state.allowance_df = read_allowance_rows_from_accounting_sheet(
+            region, cfg, st.session_state.date_start, st.session_state.date_end, dry_run=st.session_state.dry_run
+        )
+        add_log(f"已讀取 {region} 待開折讓單資料")
+    elif tab == "藍新金流":
+        st.info("請在頁面中輸入藍新交易資料後執行。")
 
 tab = st.session_state.active_tab
-if tab == "首頁": page_home()
-elif tab == "開立發票": page_issue_invoice()
-elif tab == "開立折讓單": page_allowance()
-elif tab == "下載發票": page_export_invoices(False)
-elif tab == "下載紙本發票": page_export_invoices(True)
-elif tab == "設定": page_settings()
+
+if tab == "首頁":
+    page_home()
+elif tab == "開立發票":
+    page_issue_invoice()
+elif tab == "發票下載":
+    page_invoice_download()
+elif tab == "開立折讓單":
+    page_allowance()
+elif tab == "藍新金流":
+    page_newebpay()
+elif tab == "下載檔案":
+    page_download_files()
+elif tab == "設定":
+    page_settings()
+
 page_logs()
