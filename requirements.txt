@@ -1,12 +1,6 @@
 streamlit
 pandas
 openpyxl
-python-dotenv
-sqlalchemy
-pymysql
 zeep
 requests
-pydantic
-gspread
-google-auth
 pycryptodome
