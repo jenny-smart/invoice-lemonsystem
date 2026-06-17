@@ -1,165 +1,209 @@
 """
 檸檬家事 - 發票資訊查詢與匯出
-依服務日期起迄 + 地區查詢，匯出 Excel
+登入 backend 各區帳號，依服務日期起迄查詢訂單，匯出 Excel
 """
 
 import streamlit as st
 import requests
 import pandas as pd
 from io import BytesIO
-from datetime import date, timedelta
+from datetime import date
 
 # ── 設定 ──────────────────────────────────────────────────
-API_BASE = st.secrets.get("LEMON_API_BASE", "https://api.lemonclean.com.tw")
+BACKEND = "https://backend.lemonclean.com.tw"
 
-# company_id 對應（3 = 新竹 or 高雄，由地址再判斷）
-REGIONS = {
-    "台北": 1,
-    "桃園": 2,
-    "新竹／高雄": 3,
-    "台中": 4,
+# secrets.toml 格式：
+# [backend]
+# taipei_email    = "taipei@lemon.com"
+# taipei_password = "xxxx"
+# taoyuan_email   = "taoyuan@lemon.com"
+# ...
+
+REGION_KEYS = {
+    "台北": ("taipei_email",    "taipei_password"),
+    "桃園": ("taoyuan_email",   "taoyuan_password"),
+    "新竹": ("hsinchu_email",   "hsinchu_password"),
+    "台中": ("taichung_email",  "taichung_password"),
+    "高雄": ("kaohsiung_email", "kaohsiung_password"),
 }
 
-PAYWAY_MAP = {1: "信用卡", 2: "ATM 轉帳", 3: "Line Pay / 其他", 4: "現場付款"}
-
-INVOICE_TYPE_MAP = {
-    0: "二聯式",
-    1: "捐贈",
-    2: "電子載具",
-    3: "三聯式",
-}
-
-CARRIER_TYPE_MAP = {
-    1: "會員載具",
-    2: "手機條碼",
-    3: "自然人憑證",
-    4: "捐贈",
-}
+INVOICE_TYPE_MAP  = {0: "二聯式", 1: "捐贈", 2: "電子載具", 3: "三聯式"}
+CARRIER_TYPE_MAP  = {1: "會員載具", 2: "手機條碼", 3: "自然人憑證", 4: "捐贈"}
+PAYWAY_MAP        = {1: "信用卡", 2: "ATM 轉帳", 3: "Line Pay / 其他", 4: "現場付款"}
 
 # ── 頁面設定 ───────────────────────────────────────────────
 st.set_page_config(page_title="檸檬家事 發票匯出", page_icon="🍋", layout="wide")
 
 st.markdown("""
 <style>
-    .section-title { font-size:0.9rem; font-weight:700; color:#555;
+    .section-title { font-size:.9rem; font-weight:700; color:#555;
                      border-bottom:1px solid #eee; padding-bottom:4px; margin:16px 0 10px; }
-    .stat-box { background:#f7f9fc; border-radius:8px; padding:12px 16px;
-                border-left:4px solid #FFD700; margin-bottom:8px; }
-    .stat-num { font-size:1.4rem; font-weight:700; color:#1a1a1a; }
-    .stat-label { font-size:0.8rem; color:#888; }
+    .stat-box  { background:#f7f9fc; border-radius:8px; padding:12px 16px;
+                 border-left:4px solid #FFD700; margin-bottom:8px; }
+    .stat-num  { font-size:1.4rem; font-weight:700; color:#1a1a1a; }
+    .stat-label{ font-size:.8rem; color:#888; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🍋 發票資訊查詢與匯出")
-st.caption("依服務日期起迄查詢各地區發票資料，支援分區匯出 Excel。")
+st.caption("登入各區 backend 帳號，依服務日期起迄查詢，匯出 Excel。")
 
 
 # ── 工具函式 ───────────────────────────────────────────────
-def is_hsinchu(address: str) -> bool:
-    """company_id=3，地址含新竹縣/市 → 新竹"""
-    return any(k in (address or "") for k in ["新竹縣", "新竹市"])
+def get_credentials(region: str):
+    """從 secrets 取帳密"""
+    ek, pk = REGION_KEYS[region]
+    try:
+        email    = st.secrets["backend"][ek]
+        password = st.secrets["backend"][pk]
+        return email, password
+    except Exception:
+        return None, None
 
 
-def is_kaohsiung(address: str) -> bool:
-    """company_id=3，地址含高雄/台南 → 高雄"""
-    return any(k in (address or "") for k in ["高雄縣", "高雄市", "台南縣", "台南市"])
+def backend_login(region: str) -> requests.Session | None:
+    """登入 backend，回傳帶 session cookie 的 requests.Session"""
+    email, password = get_credentials(region)
+    if not email:
+        st.error(f"❌ {region}：secrets.toml 未設定帳密（backend.{REGION_KEYS[region][0]}）")
+        return None
+
+    sess = requests.Session()
+    try:
+        # 先取 CSRF token
+        r = sess.get(f"{BACKEND}/login", timeout=10)
+        # Laravel 用 _token（hidden input）
+        from html.parser import HTMLParser
+        class TokenParser(HTMLParser):
+            token = ""
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if tag == "input" and attrs.get("name") == "_token":
+                    self.token = attrs.get("value", "")
+        p = TokenParser()
+        p.feed(r.text)
+        csrf = p.token
+
+        resp = sess.post(
+            f"{BACKEND}/login",
+            data={"email": email, "password": password, "_token": csrf},
+            timeout=15,
+            allow_redirects=True,
+        )
+        # 登入成功會跳轉到 /，失敗仍在 /login
+        if "/login" in resp.url:
+            st.error(f"❌ {region}：帳號或密碼錯誤")
+            return None
+        return sess
+    except Exception as e:
+        st.error(f"❌ {region} 登入失敗：{e}")
+        return None
 
 
-def classify_region(row: dict) -> str:
-    company_id = row.get("company_id", 0)
-    if company_id == 1:
-        return "台北"
-    elif company_id == 2:
-        return "桃園"
-    elif company_id == 3:
-        addr = row.get("address", "")
-        if is_kaohsiung(addr):
-            return "高雄"
+def fetch_purchases(sess: requests.Session, date_s: str, date_e: str) -> list:
+    """查詢訂單清單（JSON）"""
+    try:
+        resp = sess.get(
+            f"{BACKEND}/purchase",
+            params={
+                "clean_date_s": date_s,
+                "clean_date_e": date_e,
+                "purchase_status": 1,   # 已付款
+                "format": "json",       # 若 backend 支援
+            },
+            timeout=30,
+        )
+        # backend 回傳 HTML（非 JSON API），需解析 HTML table
+        # 改用 export_order endpoint 直接拿資料
+        return []
+    except Exception as e:
+        st.error(f"查詢失敗：{e}")
+        return []
+
+
+def fetch_export(sess: requests.Session, date_s: str, date_e: str) -> pd.DataFrame | None:
+    """
+    呼叫 /purchase/export_order 取得 Excel，解析成 DataFrame
+    """
+    try:
+        resp = sess.post(
+            f"{BACKEND}/purchase/export_order",
+            data={"clean_date_s": date_s, "clean_date_e": date_e},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            st.error(f"export_order 回傳 {resp.status_code}")
+            return None
+        content_type = resp.headers.get("Content-Type", "")
+        if "spreadsheet" in content_type or "excel" in content_type or "octet" in content_type:
+            df = pd.read_excel(BytesIO(resp.content))
+            return df
         else:
-            return "新竹"
-    elif company_id == 4:
-        return "台中"
-    return "其他"
+            st.error(f"未預期的回應格式：{content_type[:80]}")
+            return None
+    except Exception as e:
+        st.error(f"匯出失敗：{e}")
+        return None
 
 
-def get_invoice_display(row: dict) -> tuple[str, str, str]:
-    """
-    回傳 (發票類型顯示, 發票抬頭/統編, 載具資訊)
-    """
-    inv_type = row.get("invoice_type", 0)
+def get_invoice_display(row) -> tuple:
+    inv_type = int(row.get("invoice_type") or 0)
     type_str = INVOICE_TYPE_MAP.get(inv_type, "—")
-
     if inv_type == 3:
-        title = f"{row.get('company_title', '')}／{row.get('company_no', '')}"
+        title   = f"{row.get('company_title','')}／{row.get('company_no','')}"
         carrier = ""
     elif inv_type == 2:
         title = row.get("name", "")
-        ct = row.get("carrier_type_id", 0)
-        carrier_label = CARRIER_TYPE_MAP.get(ct, "")
-        if ct == 1:  # 會員載具
-            carrier = f"會員載具（{row.get('email', '')}）"
+        ct = int(row.get("carrier_type_id") or 0)
+        if ct == 1:
+            carrier = f"會員載具（{row.get('email','')}）"
         elif ct in (2, 3):
-            carrier = f"{carrier_label}（{row.get('carrier_info', '')}）"
+            carrier = f"{CARRIER_TYPE_MAP.get(ct,'')}（{row.get('carrier_info','')}）"
         else:
-            carrier = carrier_label
+            carrier = CARRIER_TYPE_MAP.get(ct, "")
     elif inv_type == 1:
-        title = row.get("name", "")
-        carrier = f"捐贈碼：{row.get('donate_code', '')}"
+        title   = row.get("name", "")
+        carrier = f"捐贈碼：{row.get('donate_code','')}"
     else:
-        title = row.get("name", "")
+        title   = row.get("name", "")
         carrier = ""
-
     return type_str, title, carrier
 
 
-def fetch_orders(company_id: int, date_s: str, date_e: str) -> list:
-    try:
-        resp = requests.post(
-            f"{API_BASE}/orders_by_date",
-            json={"company_id": company_id, "clean_date_s": date_s, "clean_date_e": date_e},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("return_code") == "0000":
-            return data.get("data", [])
-    except Exception as e:
-        st.error(f"查詢失敗（company_id={company_id}）：{e}")
-    return []
-
-
-def rows_to_df(rows: list) -> pd.DataFrame:
+def rows_to_invoice_df(raw_df: pd.DataFrame, region: str) -> pd.DataFrame:
+    """
+    將 backend export Excel 的欄位轉換成發票所需欄位
+    backend export 欄位參考 PurchaseService::exportOrder()
+    """
     records = []
-    for r in rows:
-        inv_type_str, inv_title, carrier_str = get_invoice_display(r)
+    for _, row in raw_df.iterrows():
+        row = row.where(pd.notna(row), other="")
+        inv_type_str, inv_title, carrier_str = get_invoice_display(row)
         records.append({
-            "服務日期":       r.get("date_clean", ""),
-            "服務時段":       f"{r.get('period_s', '')}–{r.get('period_e', '')}",
-            "訂單編號":       r.get("order_no", ""),
-            "訂購人":         r.get("name", ""),
-            "統編":           r.get("company_no", ""),
-            "電話":           r.get("phone", ""),
-            "Mail":           r.get("email", ""),
-            "地址":           r.get("address", ""),
+            "地區":           region,
+            "服務日期":       row.get("服務日期", ""),
+            "服務時段":       row.get("服務時間", ""),
+            "訂單編號":       row.get("訂單編號", ""),
+            "訂購人":         row.get("客戶姓名", ""),
+            "統編":           row.get("company_no", ""),
+            "電話":           row.get("聯絡電話", ""),
+            "Mail":           row.get("EMAIL", ""),
+            "地址":           row.get("客戶地址", ""),
             "發票類型":       inv_type_str,
             "發票抬頭／統編": inv_title,
             "載具":           carrier_str,
-            "發票號碼":       r.get("invoice_no", ""),
-            "開立日期":       r.get("created_at", "")[:10] if r.get("created_at") else "",
-            "開立金額":       (r.get("total") or 0) - (r.get("fare") or 0),
-            "地區":           classify_region(r),
+            "發票號碼":       row.get("發票號碼", ""),
+            "開立日期":       row.get("付款日期", ""),
+            "開立金額":       row.get("服務金額", ""),
         })
     return pd.DataFrame(records)
 
 
-def to_excel(region_dfs: dict[str, pd.DataFrame]) -> bytes:
-    """每個地區一個 sheet，另加一個全部 sheet"""
+def to_excel_bytes(region_dfs: dict) -> bytes:
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        # 全部
         all_df = pd.concat(region_dfs.values(), ignore_index=True) if region_dfs else pd.DataFrame()
         all_df.to_excel(writer, sheet_name="全部", index=False)
-        # 各地區
         for region, df in region_dfs.items():
             df.to_excel(writer, sheet_name=region, index=False)
     return buf.getvalue()
@@ -168,17 +212,15 @@ def to_excel(region_dfs: dict[str, pd.DataFrame]) -> bytes:
 # ── 查詢條件 ───────────────────────────────────────────────
 st.markdown('<div class="section-title">🔍 查詢條件</div>', unsafe_allow_html=True)
 
-col1, col2, col3, col4 = st.columns([2, 2, 3, 1])
-with col1:
+c1, c2, c3, c4 = st.columns([2, 2, 3, 1])
+with c1:
     date_s = st.date_input("服務日期（起）", value=date.today().replace(day=1))
-with col2:
+with c2:
     date_e = st.date_input("服務日期（迄）", value=date.today())
-with col3:
-    region_options = ["全部地區", "台北", "桃園", "新竹", "高雄", "台中"]
-    selected_regions = st.multiselect("地區", region_options,
-                                       default=["全部地區"],
-                                       placeholder="選擇地區…")
-with col4:
+with c3:
+    all_regions = list(REGION_KEYS.keys())
+    selected = st.multiselect("地區", all_regions, default=all_regions)
+with c4:
     st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
     search_btn = st.button("🔍 查詢", type="primary", use_container_width=True)
 
@@ -186,97 +228,92 @@ if date_s > date_e:
     st.warning("起始日期不能晚於結束日期。")
     st.stop()
 
-# ── 查詢 ───────────────────────────────────────────────────
+# ── 執行查詢 ───────────────────────────────────────────────
 if search_btn:
-    date_s_str = date_s.strftime("%Y-%m-%d")
-    date_e_str = date_e.strftime("%Y-%m-%d")
-
-    # 決定要查哪些 company_id
-    # 新竹和高雄都是 company_id=3，一起查再依地址拆分
-    need_company_ids = set()
-    if "全部地區" in selected_regions or not selected_regions:
-        need_company_ids = {1, 2, 3, 4}
-    else:
-        for r in selected_regions:
-            if r in ("台北",):      need_company_ids.add(1)
-            elif r in ("桃園",):    need_company_ids.add(2)
-            elif r in ("新竹", "高雄"): need_company_ids.add(3)
-            elif r in ("台中",):    need_company_ids.add(4)
-
-    all_rows = []
-    with st.spinner("查詢中…"):
-        for cid in sorted(need_company_ids):
-            rows = fetch_orders(cid, date_s_str, date_e_str)
-            all_rows.extend(rows)
-
-    if not all_rows:
-        st.warning("查無資料。")
+    if not selected:
+        st.warning("請至少選擇一個地區。")
         st.stop()
 
-    df_all = rows_to_df(all_rows)
+    date_s_str = date_s.strftime("%Y-%m-%d")
+    date_e_str = date_e.strftime("%Y-%m-%d")
+    region_dfs = {}
 
-    # 依地區篩選（若選全部就不過濾）
-    if "全部地區" not in selected_regions and selected_regions:
-        df_all = df_all[df_all["地區"].isin(selected_regions)]
+    progress = st.progress(0, text="開始查詢…")
+    for i, region in enumerate(selected):
+        progress.progress((i) / len(selected), text=f"登入 {region}…")
+        sess = backend_login(region)
+        if sess is None:
+            continue
 
-    st.session_state.df_all = df_all
-    st.session_state.query_label = f"{date_s_str} ～ {date_e_str}"
+        progress.progress((i + 0.5) / len(selected), text=f"查詢 {region} 訂單…")
+        raw_df = fetch_export(sess, date_s_str, date_e_str)
+        if raw_df is None or raw_df.empty:
+            st.warning(f"⚠️ {region}：查無資料或匯出失敗")
+            continue
+
+        inv_df = rows_to_invoice_df(raw_df, region)
+        region_dfs[region] = inv_df
+        progress.progress((i + 1) / len(selected), text=f"{region} 完成（{len(inv_df)} 筆）")
+
+    progress.empty()
+
+    if not region_dfs:
+        st.error("所有地區查詢均失敗。")
+        st.stop()
+
+    st.session_state.region_dfs   = region_dfs
+    st.session_state.query_label  = f"{date_s_str} ～ {date_e_str}"
 
 # ── 顯示結果 ───────────────────────────────────────────────
-if "df_all" not in st.session_state:
+if "region_dfs" not in st.session_state:
     st.stop()
 
-df_all = st.session_state.df_all
-label  = st.session_state.query_label
+region_dfs = st.session_state.region_dfs
+label      = st.session_state.query_label
+all_df     = pd.concat(region_dfs.values(), ignore_index=True)
 
 st.markdown(f'<div class="section-title">📊 查詢結果｜{label}</div>', unsafe_allow_html=True)
 
 # 統計卡
-regions_in_data = ["台北", "桃園", "新竹", "高雄", "台中"]
-stat_cols = st.columns(len(regions_in_data) + 1)
+stat_cols = st.columns(len(region_dfs) + 1)
 with stat_cols[0]:
     st.markdown(
-        f'<div class="stat-box"><div class="stat-num">{len(df_all)}</div>'
+        f'<div class="stat-box"><div class="stat-num">{len(all_df)}</div>'
         f'<div class="stat-label">全部筆數</div></div>', unsafe_allow_html=True)
-for i, r in enumerate(regions_in_data):
-    cnt = len(df_all[df_all["地區"] == r])
+for i, (r, df) in enumerate(region_dfs.items()):
     with stat_cols[i + 1]:
+        amt = pd.to_numeric(df["開立金額"], errors="coerce").sum()
         st.markdown(
-            f'<div class="stat-box"><div class="stat-num">{cnt}</div>'
-            f'<div class="stat-label">{r}</div></div>', unsafe_allow_html=True)
+            f'<div class="stat-box"><div class="stat-num">{len(df)}</div>'
+            f'<div class="stat-label">{r}｜NT$ {int(amt):,}</div></div>',
+            unsafe_allow_html=True)
 
-# 地區分頁顯示
-tab_labels = ["全部"] + [r for r in regions_in_data if len(df_all[df_all["地區"] == r]) > 0]
-tabs = st.tabs(tab_labels)
-
+# 分頁顯示
 display_cols = ["服務日期", "服務時段", "訂單編號", "訂購人", "統編",
                 "電話", "Mail", "地址", "發票類型", "發票抬頭／統編",
                 "載具", "發票號碼", "開立日期", "開立金額"]
 
-region_dfs = {}
+tabs = st.tabs(["全部"] + list(region_dfs.keys()))
 with tabs[0]:
-    st.dataframe(df_all[display_cols], use_container_width=True, hide_index=True)
+    st.dataframe(all_df[display_cols], use_container_width=True, hide_index=True)
+for i, (r, df) in enumerate(region_dfs.items()):
+    with tabs[i + 1]:
+        total = pd.to_numeric(df["開立金額"], errors="coerce").sum()
+        st.caption(f"共 {len(df)} 筆，合計 NT$ {int(total):,}")
+        st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
 
-for i, r in enumerate(tab_labels[1:], 1):
-    rdf = df_all[df_all["地區"] == r][display_cols].reset_index(drop=True)
-    region_dfs[r] = rdf
-    with tabs[i]:
-        total = rdf["開立金額"].sum()
-        st.caption(f"共 {len(rdf)} 筆，合計 NT$ {total:,}")
-        st.dataframe(rdf, use_container_width=True, hide_index=True)
-
-# ── 匯出 Excel ────────────────────────────────────────────
+# ── 匯出 ───────────────────────────────────────────────────
 st.markdown("---")
-ex_col1, ex_col2 = st.columns([1, 3])
-with ex_col1:
-    excel_bytes = to_excel(region_dfs if region_dfs else {"全部": df_all[display_cols]})
+ex1, ex2 = st.columns([1, 3])
+with ex1:
+    excel_bytes = to_excel_bytes(region_dfs)
     st.download_button(
         label="📥 匯出 Excel",
         data=excel_bytes,
-        file_name=f"invoice_{label.replace(' ', '').replace('～', '_')}.xlsx",
+        file_name=f"invoice_{label.replace(' ','').replace('～','_')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
         use_container_width=True,
     )
-with ex_col2:
-    st.caption("Excel 包含「全部」sheet 及各地區獨立 sheet。")
+with ex2:
+    st.caption("Excel 包含「全部」sheet 及各地區獨立 sheet，欄位：服務日期、時段、訂單編號、發票類型、抬頭統編、載具、開立金額等。")
