@@ -228,37 +228,71 @@ elif invoice_type == 3:
 # ── 發票明細 ─────────────────────────────────────
 st.markdown('<div class="section-title">📦 發票明細</div>', unsafe_allow_html=True)
 
+# 確保 items 一定是 list
+if not isinstance(st.session_state.get("items"), list):
+    st.session_state.items = []
+
 # 新增一筆
 with st.container(border=True):
     st.markdown("**新增項目**")
-    na_col, nb_col, nc_col, nd_col = st.columns([3, 1, 1, 1])
-    with na_col:
-        sel_name = st.selectbox("商品", PRODUCT_NAMES, key="sel_product", label_visibility="collapsed")
-    # 找對應 product tuple
-    sel_idx   = PRODUCT_NAMES.index(sel_name)
-    sel_prod  = PRODUCTS[sel_idx]   # (id, name, spec, unit, price, editable)
-    with nb_col:
-        new_qty = st.number_input("數量", min_value=1, value=1, step=1, key="new_qty", label_visibility="collapsed")
-    with nc_col:
-        if sel_prod[5]:  # editable price
-            new_price = st.number_input("單價", min_value=0, value=sel_prod[4], step=10, key="new_price", label_visibility="collapsed")
-        else:
-            st.markdown(f"<div style='padding-top:6px;font-weight:600'>{sel_prod[4]:,}</div>", unsafe_allow_html=True)
-            new_price = sel_prod[4]
-    with nd_col:
-        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-        add_btn = st.button("＋ 加入", use_container_width=True)
 
-    if add_btn:
-        st.session_state.items.append({
-            "name":       sel_prod[1],
-            "spec":       sel_prod[2],
-            "unit":       sel_prod[3],
-            "qty":        new_qty,
-            "unit_price": new_price,
-            "editable":   sel_prod[5],
-        })
-        st.rerun()
+    add_mode = st.radio("新增方式", ["從清單選擇", "自訂品項"], horizontal=True, key="add_mode")
+
+    if add_mode == "從清單選擇":
+        na_col, nb_col, nc_col, nd_col = st.columns([3, 1, 1, 1])
+        with na_col:
+            sel_name = st.selectbox("商品", PRODUCT_NAMES, key="sel_product", label_visibility="collapsed")
+        sel_idx  = PRODUCT_NAMES.index(sel_name)
+        sel_prod = PRODUCTS[sel_idx]
+        with nb_col:
+            new_qty = st.number_input("數量", min_value=1, value=1, step=1,
+                                      key="new_qty", label_visibility="collapsed")
+        with nc_col:
+            if sel_prod[5]:
+                new_price = st.number_input("單價", min_value=0, value=sel_prod[4], step=10,
+                                             key="new_price", label_visibility="collapsed")
+            else:
+                st.markdown(f"<div style='padding-top:6px;font-weight:600'>{sel_prod[4]:,}</div>",
+                             unsafe_allow_html=True)
+                new_price = sel_prod[4]
+        with nd_col:
+            st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+            add_btn = st.button("＋ 加入", use_container_width=True, key="add_preset")
+        if add_btn:
+            st.session_state.items.append({
+                "name": sel_prod[1], "spec": sel_prod[2], "unit": sel_prod[3],
+                "qty": new_qty, "unit_price": new_price, "editable": True,
+            })
+            st.rerun()
+
+    else:  # 自訂品項
+        ca, cb, cc, cd, ce = st.columns([3, 1, 1, 1, 1])
+        with ca:
+            custom_name = st.text_input("品項名稱", placeholder="例：深度清潔-浴室",
+                                         key="custom_name", label_visibility="collapsed")
+        with cb:
+            custom_unit = st.text_input("單位", value="次", key="custom_unit",
+                                         label_visibility="collapsed")
+        with cc:
+            custom_qty = st.number_input("數量", min_value=1, value=1, step=1,
+                                          key="custom_qty", label_visibility="collapsed")
+        with cd:
+            custom_price = st.number_input("單價", min_value=0, value=0, step=100,
+                                            key="custom_price", label_visibility="collapsed")
+        with ce:
+            st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
+            add_custom_btn = st.button("＋ 加入", use_container_width=True, key="add_custom")
+        if add_custom_btn:
+            if not custom_name.strip():
+                st.warning("請輸入品項名稱。")
+            elif custom_price <= 0:
+                st.warning("請輸入單價。")
+            else:
+                st.session_state.items.append({
+                    "name": custom_name.strip(), "spec": "", "unit": custom_unit,
+                    "qty": custom_qty, "unit_price": custom_price, "editable": True,
+                })
+                st.rerun()
 
 # 顯示已加入的明細
 items = st.session_state.items
